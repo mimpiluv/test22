@@ -32,6 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/tailscale"
@@ -140,6 +142,10 @@ type Server struct {
 	removePktForwardOther        expvar.Int
 	avgQueueDuration             *uint64          // In milliseconds; accessed atomically
 	tcpRtt                       metrics.LabelMap // histogram
+	// Prometheus histogram for packet sizes
+	packetSampleNum  int                  // how many times we've seen a packet
+	packetSampleRate int                  // sample one out of this many packets
+	packetSizes      prometheus.Histogram // methods are thread-safe
 
 	// verifyClients only accepts client connections to the DERP server if the clientKey is a
 	// known peer in the network, as specified by a running tailscaled's client's LocalAPI.
@@ -333,6 +339,14 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	}
 	s.packetsDroppedTypeDisco = s.packetsDroppedType.Get("disco")
 	s.packetsDroppedTypeOther = s.packetsDroppedType.Get("other")
+	s.packetSampleRate = 1000
+	s.packetSizes = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name: "derp_packet_sizes_bytes",
+		Help: "Distribution of packet sizes",
+		// Buckets of 10 bytes to 9173 bytes.
+		Buckets: prometheus.ExponentialBuckets(10, 1.3, 27),
+	})
+
 	return s
 }
 
@@ -1248,6 +1262,15 @@ func (s *Server) recvPacket(br *bufio.Reader, frameLen uint32) (dstKey key.NodeP
 	}
 	s.packetsRecv.Add(1)
 	s.bytesRecv.Add(int64(len(contents)))
+
+	// TODO: Accessed concurrently by all sclient threads, should
+	// this be atomic? It's okay if we don't sample EXACTLY every
+	// packetSampleRate packet.
+	if s.packetSampleNum++; s.packetSampleNum >= s.packetSampleRate {
+		s.packetSampleNum = 0
+		s.packetSizes.Observe(float64(len(contents)))
+
+	}
 	if disco.LooksLikeDiscoWrapper(contents) {
 		s.packetsRecvDisco.Add(1)
 	} else {
