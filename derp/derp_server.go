@@ -34,7 +34,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go4.org/mem"
 	"golang.org/x/sync/errgroup"
 	"tailscale.com/client/tailscale"
@@ -96,19 +95,30 @@ const (
 // solely by run(), read by the debug server, and do not need to be
 // thread-safe.
 type flowStats struct {
-	bytes   int64
-	packets int64
-	// TODO: replace with a server thread that sweeps every N time
-	// units
+	bytes      int64
+	packets    int64
 	lastActive time.Time
 }
 
-// uniqueConn is used to uniquely index flows by source, since the
-// source public key can be duplicated by multiple connected
-// clients. The connection number is used to disambiguate them.
+// We need several different ways to look up flowStats
+//
+// From sclient.run(), via c.flows: by dst, then connNum in clientSet
+// From sclient.run(), via s.flows: by dst, then src,connNum
+// From UpdateAllFlows(), via s.curr/lastFlows: by src,dst,connNum
+
+// uniqueConn is used to uniquely index the server's flow map by
+// src,connNum, since the source public key can be duplicated by
+// multiple connected clients. The connection number is used to
+// disambiguate them.
 type uniqueConn struct {
 	key     key.NodePublic
 	connNum int64
+}
+
+// flowKey is used to index our sortable slices of flow stats
+type flowKey struct {
+	srcKey, dstKey key.NodePublic
+	connNum        int64
 }
 
 type align64 [0]atomic.Int64 // for side effect of its 64-bit alignment
@@ -202,6 +212,14 @@ type Server struct {
 	//
 	// TODO: this seems like it should obviously be merged with sentTo[][]
 	flows map[key.NodePublic]map[uniqueConn]*flowStats // dst => src,connNum => flow stats
+	// Lots of flow-related tunables
+	flowsUpdateInterval   time.Duration         // How often we update/clean flow stats
+	flowsIdleTime         time.Duration         // How long before a flow is considered unused
+	flowsCurrSnapshot     map[flowKey]flowStats // Flow stats as of now
+	flowsLastSnapshot     map[flowKey]flowStats // Flow stats as of 1 update interval ago
+	flowsBytesPerSecond   prometheus.Histogram  // methods are thread-safe
+	flowsPacketsPerSecond prometheus.Histogram  // methods are thread-safe
+
 	// maps from netip.AddrPort to a client's public key
 	keyOfAddr map[netip.AddrPort]key.NodePublic
 }
@@ -359,6 +377,10 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 		tcpRtt:               metrics.LabelMap{Label: "le"},
 		keyOfAddr:            map[netip.AddrPort]key.NodePublic{},
 		flows:                map[key.NodePublic]map[uniqueConn]*flowStats{},
+		flowsIdleTime:        60 * time.Second,
+		flowsUpdateInterval:  5 * time.Second,
+		flowsCurrSnapshot:    map[flowKey]flowStats{},
+		flowsLastSnapshot:    map[flowKey]flowStats{},
 	}
 	s.initMetacert()
 	s.packetsRecvDisco = s.packetsRecvByKind.Get("disco")
@@ -375,14 +397,34 @@ func NewServer(privateKey key.NodePrivate, logf logger.Logf) *Server {
 	s.packetsDroppedTypeDisco = s.packetsDroppedType.Get("disco")
 	s.packetsDroppedTypeOther = s.packetsDroppedType.Get("other")
 	s.packetSampleRate = 1000
-	s.packetSizes = promauto.NewHistogram(prometheus.HistogramOpts{
+	s.packetSizes = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "derp_packet_sizes_bytes",
 		Help: "Distribution of packet sizes",
 		// Buckets of 10 bytes to 9173 bytes.
 		Buckets: prometheus.ExponentialBuckets(10, 1.3, 27),
 	})
-
+	s.flowsBytesPerSecond = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "derp_flow_bytes_per_second",
+		Help: "Distribution of bytes per second per flow",
+		// Buckets of 1KBps to 16MBps
+		Buckets: prometheus.ExponentialBuckets(500, 1.5, 25),
+	})
+	s.flowsPacketsPerSecond = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name: "derp_flow_packets_per_second",
+		Help: "Distribution of bytes per second per flow",
+		// Buckets of 1 to 16K pps.
+		Buckets: prometheus.ExponentialBuckets(1, 1.5, 25),
+	})
 	return s
+}
+
+// RegisterMetrics starts up Prometheus metrics more complicated than
+// simple counters. It should only be called once per process, and
+// before serving begins.
+func (s *Server) RegisterMetrics() {
+	prometheus.MustRegister(s.packetSizes)
+	prometheus.MustRegister(s.flowsBytesPerSecond)
+	prometheus.MustRegister(s.flowsPacketsPerSecond)
 }
 
 // SetMesh sets the pre-shared key that regional DERP servers used to mesh
@@ -1004,10 +1046,9 @@ func (s *Server) notePeerSendLocked(src key.NodePublic, dst *sclient) {
 // from this sclient to this destination key. It should only be called
 // when the src sclient's map is empty (and therefore the Server's?). XXX
 func (s *Server) getFlowStatsLocked(c *sclient, dstKey key.NodePublic) *flowStats {
-	if m, ok := s.flows[dstKey]; !ok {
+	if _, ok := s.flows[dstKey]; !ok {
 		// alloc the second level map
-		m = map[uniqueConn]*flowStats{}
-		s.flows[dstKey] = m
+		s.flows[dstKey] = map[uniqueConn]*flowStats{}
 	}
 	u := uniqueConn{c.key, c.connNum}
 	// debugging
@@ -1465,14 +1506,17 @@ type sclient struct {
 	// address.
 	//
 	// Allocation of the underlying struct and population of
-	// server and client maps happens in run() under s.mu.
+	// server map happens in run() under s.mu. Population of
+	// sclient map happens outside of s.mu(), also in run().
 	//
 	// Update of the counters inside flowStats happens in run()
 	// and they are not thread-safe.
 	//
-	// Deletion of the map entries happens under s.mu, also in
-	// run()
-	flows map[key.NodePublic]*flowStats // dst => src,connNum,dst flow stats
+	// Deletion of the map entries in the server happens under
+	// s.mu in the periodic call to UpdateAllFlows().
+	//
+	// TODO: delete the sclient flow pointer via chan message
+	flows map[key.NodePublic]*flowStats // dst => flow stats for src,dst,connNum
 }
 
 // peerConnState represents whether a peer is connected to the server
@@ -2077,45 +2121,117 @@ func (s *Server) ServeDebugTraffic(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Print a list of data flows that have gone through this server
-// between connected clients. Includes clients which are currently
-// communicating directly but still using this DERP server as their
-// home.
-//
-// TODO: What else do we want to know? Time connection was
-// established? Time since last packet? Average bandwidth?
-//
-// TODO: Convert into Prometheus histograms
+// UpdateAllFlows periodically takes snapshots of flows, frees idle
+// ones, and updates flow-related histograms.
+func (s *Server) UpdateAllFlows() {
+	ticker := time.NewTicker(s.flowsUpdateInterval)
+	// This function never exits but maybe in the future it will
+	defer ticker.Stop()
+	t := time.Now()
+
+	// Regardless of the update interval, run one second after
+	// startup so we get some output immediately, but the interval
+	// is long enough to not have an absurd outlier in the data.
+	for time.Sleep(time.Second); true; <-ticker.C {
+		lastT := t
+		t = time.Now()
+
+		// TODO: this may be a long time to be holding a lock
+		// that we grab twice per packet.
+		s.mu.Lock()
+		// Save a copy of the flows as of flowsUpdateInterval ago
+		// TODO: have to make a map a second time or just set to nil map?
+		s.flowsLastSnapshot = make(map[flowKey]flowStats)
+		for k, v := range s.flowsCurrSnapshot {
+			s.flowsLastSnapshot[k] = v
+		}
+		// Make a copy of the current flows
+		s.flowsCurrSnapshot = make(map[flowKey]flowStats)
+		for dstKey := range s.flows {
+			for srcConn, f := range s.flows[dstKey] {
+				k := flowKey{
+					srcKey:  srcConn.key,
+					dstKey:  dstKey,
+					connNum: srcConn.connNum,
+				}
+				s.flowsCurrSnapshot[k] = *f
+				// delete idle flows while we are at it
+				if t.Sub(f.lastActive) > s.flowsIdleTime {
+					delete(s.flows[dstKey], srcConn)
+					if len(s.flows[dstKey]) == 0 {
+						delete(s.flows, dstKey)
+					}
+					// TODO: This may be
+					// thread-safe with run() but
+					// I'm not sure.
+					set := s.clients[srcConn.key]
+					set.ForeachClient(func(c *sclient) {
+						if c.connNum == srcConn.connNum {
+							delete(c.flows, dstKey)
+						}
+					})
+
+				}
+			}
+		}
+		s.mu.Unlock()
+
+		// Update the bytes/packets per second histograms
+		dur := t.Sub(lastT)
+		for k, v := range s.flowsCurrSnapshot {
+			bytes := v.bytes - s.flowsLastSnapshot[k].bytes
+			s.flowsBytesPerSecond.Observe(float64((bytes / int64(dur.Seconds()))))
+			packets := v.packets - s.flowsLastSnapshot[k].packets
+			s.flowsPacketsPerSecond.Observe(float64((packets / int64(dur.Seconds()))))
+		}
+	}
+}
+
+// Print a list of recently active data flows through this
+// server. Includes data flows from clients not directly connected to
+// this server.
+
 func (s *Server) ServeDebugFlows(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "current time: %s\n", time.Now().Format("2006-01-02 15:04:05"))
+
 	type flowLine struct {
 		srcKey, dstKey key.NodePublic
-		connNum        int64
+		connNum        int64 // unused at present
 		f              flowStats
 	}
-	flows := make([]flowLine, 0)
 	s.mu.Lock()
-	// Copy the whole map into a more sortable data structure so we
-	// can drop the server lock quickly.
-	for dstKey := range s.flows {
-		for u, f := range s.flows[dstKey] {
-			flows = append(flows, flowLine{
-				srcKey:  u.key,
-				dstKey:  dstKey,
-				connNum: u.connNum,
-				f:       *f})
-		}
+	// Copy current flow snapshot into a sortable slice
+	curr := make([]flowLine, 0)
+	for k, v := range s.flowsCurrSnapshot {
+		curr = append(curr, flowLine{
+			srcKey:  k.srcKey,
+			dstKey:  k.dstKey,
+			connNum: k.connNum,
+			f:       v,
+		})
 	}
 	s.mu.Unlock()
 
-	fmt.Fprintf(w, "number flows: %v\n", len(flows))
+	fmt.Fprintf(w, "number flows: %v\n", len(curr))
 	// Sort by largest flow
-	sort.Slice(flows, func(i, j int) bool { return flows[i].f.bytes < flows[j].f.bytes })
+	sort.Slice(curr, func(i, j int) bool { return curr[i].f.bytes < curr[j].f.bytes })
 
 	now := time.Now()
-	fmt.Fprintf(w, "src\tdst\tconn\tbytes\tpackets\tsecs_since_active\n")
-	for _, f := range flows {
-		fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%d\n", f.srcKey.ShortString(), f.dstKey.ShortString(), f.connNum, f.f.bytes, f.f.packets, int64(now.Sub(f.f.lastActive).Seconds()))
+	headStr := "%-25s %-20s %20s %20s %s\n"
+	bodyStr := "%-25s %-20s %20d %20d %5d\n"
+	fmt.Fprintf(w, headStr, "source", "destination", "bytes", "packets", "last active (seconds)")
+	for _, f := range curr {
+		// TODO: massively inefficient
+		var srcAddr, dstAddr netip.AddrPort
+		for addr, key := range s.keyOfAddr {
+			if key == f.srcKey {
+				srcAddr = addr
+			}
+			if key == f.dstKey {
+				dstAddr = addr
+			}
+		}
+		fmt.Fprintf(w, bodyStr, srcAddr, dstAddr, f.f.bytes, f.f.packets, int(now.Sub(f.f.lastActive).Seconds()))
 	}
 
 	w.(http.Flusher).Flush()

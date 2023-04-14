@@ -151,6 +151,7 @@ func main() {
 
 	s := derp.NewServer(cfg.PrivateKey, log.Printf)
 	s.SetVerifyClient(*verifyClients)
+	s.RegisterMetrics()
 
 	if *meshPSKFile != "" {
 		b, err := os.ReadFile(*meshPSKFile)
@@ -218,6 +219,9 @@ func main() {
 	}))
 	debug.Handle("traffic", "Traffic check", http.HandlerFunc(s.ServeDebugTraffic))
 	debug.Handle("flows", "Flows", http.HandlerFunc(s.ServeDebugFlows))
+
+	// Track and clean per-flow stats
+	go s.UpdateAllFlows()
 
 	if *runSTUN {
 		go serveSTUN(listenHost, *stunPort)
