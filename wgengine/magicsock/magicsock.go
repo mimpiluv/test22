@@ -4920,7 +4920,25 @@ func betterAddr(a, b addrLatency) bool {
 			return false
 		}
 	}
-	return a.latency < b.latency
+
+	// If a is higher-latency than b, then it's not better.
+	if a.latency >= b.latency {
+		return false
+	}
+
+	// Don't prefer a to b if it's lower-latency but the improvement is
+	// less than 1%; we want a bit of "stickiness" (a.k.a. hysteresis) to
+	// avoid flapping if there's two roughly-equivalent endpoints.
+	//
+	// Note: we know that a.latency < b.latency, from above, so a/b is
+	// always < 1 here.
+	if pct := float64(a.latency) / float64(b.latency); pct > 0.99 {
+		return false
+	}
+
+	// We know that a.latency < b.latency, and it's lower by more than our
+	// threshold above, thus this is a better addr.
+	return true
 }
 
 // endpoint.mu must be held.
